@@ -5,7 +5,7 @@ class MainTest {
   @Test
   fun test() {
     generateCode(
-      schemaFile = File("/Users/martinbonnin/git/spotify-showcase/client/schema.graphql"),
+      schemaFile = File("/Users/martinbonnin/git/spotify-showcase/subgraphs/spotify/schema.graphql"),
       outputDirectory = File("/Users/martinbonnin/git/apollo-kotlin-spotify-showcase/server/src/main/kotlin/"),
       packageName = "server.graphql",
       scalarMapping = mapOf(

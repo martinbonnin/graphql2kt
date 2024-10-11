@@ -19,7 +19,7 @@ fun generateCode(
   optionalClassName: String,
   addApolloExecutionAnnotations: Boolean
 ) {
-  val schema = schemaFile.toGQLDocument().toSchema()
+  val schema = schemaFile.toGQLDocument().validateAsSchema().value!!
 
   outputDirectory.apply {
     resolve(packageName.replace(".", File.pathSeparator)).deleteRecursively()
@@ -139,13 +139,14 @@ internal class Context(
   private fun TypeSpec.Builder.addFields(
     fields: List<GQLFieldDefinition>,
     superFields: Set<String>,
-    withInitializer: Boolean,
-    isSubscription: Boolean
+    objectName: String?,
+    isSubscription: Boolean,
   ) = apply {
 
+    val objectHasId = fields.any { it.name == "id" }
+
     fields.forEach { fieldDefinition ->
-      val typeDefinition = schema.typeDefinition(fieldDefinition.type.rawType().name)
-      if (!isSubscription && typeDefinition is GQLScalarTypeDefinition && fieldDefinition.arguments.isEmpty() && fieldDefinition.name == "id") {
+      if (fieldDefinition.name == "id") {
         addProperty(
           PropertySpec.builder(fieldDefinition.name, fieldDefinition.type.toClassName())
             .apply {
@@ -153,7 +154,7 @@ internal class Context(
                 addModifiers(KModifier.OVERRIDE)
               }
               maybeAddDescription(fieldDefinition.description)
-              if (withInitializer) {
+              if (objectName != null) {
                 initializer("%L", fieldDefinition.name)
               }
             }
@@ -163,8 +164,16 @@ internal class Context(
         addFunction(
           FunSpec.builder(fieldDefinition.name)
             .returns(fieldDefinition.type.toOutputClassName(isSubscription))
-            .addParameter(ParameterSpec.builder("executionContext", ClassName("com.apollographql.apollo.api", "ExecutionContext")).build())
             .apply {
+              if (objectHasId) {
+                addParameter(
+                  ParameterSpec.builder(
+                    "executionContext",
+                    ClassName("com.apollographql.apollo.api", "ExecutionContext")
+                  ).build()
+                )
+                addModifiers(KModifier.SUSPEND)
+              }
               fieldDefinition.arguments.forEach { argumentDefinition ->
                 addParameter(
                   ParameterSpec.builder(
@@ -181,8 +190,20 @@ internal class Context(
                 addModifiers(KModifier.OVERRIDE)
               }
               maybeAddDescription(fieldDefinition.description)
+              if (objectName != null) {
+                if (objectHasId) {
+                  addCode("·return (${objectName.decapitalizeFirstChar()}?.${fieldDefinition.name} ?: executionContext.%M.get${objectName.capitalizeFirstChar()}(id).${fieldDefinition.name})", MemberName("server", "dataloader"))
+                } else if (fieldDefinition.arguments.any { it.name == "id" }) {
+                  addCode("·return ${fieldDefinition.name.toKotlinClassName()}(id, null)")
+                } else if (fieldDefinition.arguments.any { it.name == "ids" }) {
+                  addCode("·return ids.map { ${fieldDefinition.name.toKotlinClassName().removeSuffix("s")}(it, null) }")
+                } else if (objectName in setOf("Query", "Mutation", "Subscription")) {
+                  addCode("TODO()")
+                } else {
+                  addCode("·return ${objectName.decapitalizeFirstChar()}.${fieldDefinition.name}")
+                }
+              }
             }
-            .addCode("TODO()")
             .build()
         )
       }
@@ -256,11 +277,32 @@ internal class Context(
 
     val isSubscription = name == schema.rootTypeNameFor("subscription")
 
+    val hasId = fields.any { it.name == "id" }
+
     return FileSpec.builder(packageName, name)
       .addType(
         TypeSpec.classBuilder(name.toKotlinClassName())
           .addSuperTypes(superTypes)
-          .addFields(fields, superFields, true, isSubscription)
+          .apply {
+            if (hasId) {
+              addProperty(
+                PropertySpec.builder(name.decapitalizeFirstChar(), ClassName("server.rest.models", "Simplified${name.toKotlinClassName()}Object").copy(nullable = true))
+                  .initializer("%L", name.decapitalizeFirstChar())
+                  .addModifiers(KModifier.PRIVATE)
+                  .build()
+              )
+            } else if (name in setOf("Query", "Subscription", "Mutation")) {
+
+            } else {
+              addProperty(
+                PropertySpec.builder(name.decapitalizeFirstChar(), ClassName("server.rest.models", "${name.toKotlinClassName()}Object"))
+                  .initializer("%L", name.decapitalizeFirstChar())
+                  .addModifiers(KModifier.PRIVATE)
+                  .build()
+              )
+            }
+          }
+          .addFields(fields, superFields, name, isSubscription)
           .primaryConstructorFromProperties()
           .maybeAddDescription(description)
           .maybeAddRootAnnotation(this)
@@ -296,7 +338,7 @@ internal class Context(
         TypeSpec.interfaceBuilder(name.toKotlinClassName())
           .addModifiers(KModifier.SEALED)
           .addSuperTypes(superTypes)
-          .addFields(fields, superFields, false, false)
+          .addFields(fields, superFields, null, false)
           .maybeAddDescription(description)
           .build()
       )
@@ -356,7 +398,10 @@ private fun TypeSpec.Builder.primaryConstructorFromProperties(): TypeSpec.Builde
   return primaryConstructor(
     FunSpec.constructorBuilder()
       .apply {
-        propertySpecs.forEach { propertySpec ->
+        propertySpecs.filter { it.name == "id" }.forEach { propertySpec ->
+          addParameter(ParameterSpec.builder(propertySpec.name, propertySpec.type).build())
+        }
+        propertySpecs.filter { it.name != "id" }.filter { !it.name.startsWith("cached") }.forEach { propertySpec ->
           addParameter(ParameterSpec.builder(propertySpec.name, propertySpec.type).build())
         }
       }
@@ -364,6 +409,7 @@ private fun TypeSpec.Builder.primaryConstructorFromProperties(): TypeSpec.Builde
   )
 }
 
-internal fun String.toKotlinClassName() = replaceFirstChar { it.uppercase() }
+internal fun String.toKotlinClassName() = capitalizeFirstChar()
 
 internal fun String.capitalizeFirstChar() = replaceFirstChar { it.uppercase() }
+internal fun String.decapitalizeFirstChar() = replaceFirstChar { it.lowercase() }
